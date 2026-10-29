@@ -1,0 +1,10 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n nothing-ear-audio-fix && bash tests/integration.sh

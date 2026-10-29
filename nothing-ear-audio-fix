@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Keep local desktop audio separate from Chrome Remote Desktop audio.
+config_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_root="${XDG_STATE_HOME:-$HOME/.local/state}/nothing-ear-audio-fix"
+local_socket="unix:/run/user/$(id -u)/pulse/native"
+device_address="${NOTHING_EAR_ADDRESS:-}"
+if [[ -z "$device_address" && -f "$state_root/device-address" ]]; then
+  device_address="$(cat "$state_root/device-address")"
+fi
+mode="${1:-apply}"
+if [[ "$mode" != check ]]; then
+  [[ "$device_address" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || {
+    echo 'NOTHING_EAR_ADDRESS に対象機器のBluetoothアドレスを指定してください。' >&2
+    exit 2
+  }
+fi
+device_address="${device_address^^}"
+sink="bluez_output.$device_address"
+card="bluez_card.${device_address//:/_}"
+mode="${1:-apply}"
+files=(
+  'systemd/user/wireplumber.service.d/10-local-audio.conf'
+  'systemd/user/plasma-plasmashell.service.d/10-local-audio.conf'
+  'wireplumber/wireplumber.conf.d/51-nothing-ear-volume.conf'
+)
+check() {
+  systemctl --user is-active wireplumber.service plasma-plasmashell.service || true
+  systemctl --user show wireplumber.service plasma-plasmashell.service -p Environment
+  printf '現在の標準出力: '
+  PULSE_SERVER="$local_socket" pactl get-default-sink
+  PULSE_SERVER="$local_socket" pactl get-sink-volume @DEFAULT_SINK@
+}
+restart_audio() {
+  systemctl --user daemon-reload
+  systemctl --user restart wireplumber.service
+  for ((attempt=0; attempt<30; attempt++)); do
+    if PULSE_SERVER="$local_socket" pactl list short sinks | awk '{print $2}' | grep -Fxq "$sink"; then
+      PULSE_SERVER="$local_socket" pactl set-default-sink "$sink"
+      break
+    fi
+    sleep 0.5
+  done
+  systemctl --user restart plasma-plasmashell.service
+}
+case "$mode" in
+  check) check; exit ;;
+  restart) restart_audio; check; exit ;;
+  undo)
+    [[ -f "$state_root/installed" ]] || { echo '復元用バックアップがありません。'; exit 1; }
+    for relative in "${files[@]}"; do
+      if [[ -f "$state_root/backup/$relative" ]]; then
+        mkdir -p "$(dirname "$config_root/$relative")"
+        cp -p "$state_root/backup/$relative" "$config_root/$relative"
+      else
+        rm -f "$config_root/$relative"
+      fi
+    done
+    restart_audio
+    rm -f "$state_root/installed"
+    rm -rf "$state_root/backup"
+    echo '初回適用直前の設定へ復元しました。'
+    exit ;;
+  apply) ;;
+  *) echo '使い方: nothing-ear-audio-fix [apply|check|restart|undo]'; exit 2 ;;
+esac
+mkdir -p "$state_root"
+printf '%s\n' "$device_address" > "$state_root/device-address"
+if [[ ! -f "$state_root/installed" ]]; then
+  for relative in "${files[@]}"; do
+    if [[ -e "$config_root/$relative" ]]; then
+      mkdir -p "$(dirname "$state_root/backup/$relative")"
+      cp -p "$config_root/$relative" "$state_root/backup/$relative"
+    fi
+  done
+  touch "$state_root/installed"
+fi
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+cat > "$work_dir/0" <<'CONF'
+[Service]
+Environment=PIPEWIRE_REMOTE=pipewire-0
+UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK PULSE_SERVER
+CONF
+cat > "$work_dir/1" <<CONF
+[Service]
+Environment=PIPEWIRE_REMOTE=pipewire-0
+Environment=PULSE_SERVER=$local_socket
+UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK
+CONF
+cat > "$work_dir/2" <<CONF
+# Use software volume for Nothing Ear to avoid Bluetooth volume feedback.
+monitor.bluez.rules = [
+  {
+    matches = [ { device.name = "$card" } ]
+    actions = {
+      update-props = {
+        bluez5.hw-volume = [ ]
+      }
+    }
+  }
+]
+CONF
+changed=0
+for index in "${!files[@]}"; do
+  target="$config_root/${files[$index]}"
+  if ! cmp -s "$work_dir/$index" "$target"; then
+    mkdir -p "$(dirname "$target")"
+    cp "$work_dir/$index" "$target"
+    changed=1
+  fi
+done
+if ((changed)); then
+  restart_audio
+  echo '設定を適用して音声管理とパネルを再起動しました。'
+else
+  echo '設定は適用済みです。再起動は省略しました。'
+fi
+check
