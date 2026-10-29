@@ -18,7 +18,6 @@ fi
 device_address="${device_address^^}"
 sink="bluez_output.$device_address"
 card="bluez_card.${device_address//:/_}"
-mode="${1:-apply}"
 files=(
   'systemd/user/wireplumber.service.d/10-local-audio.conf'
   'systemd/user/plasma-plasmashell.service.d/10-local-audio.conf'
@@ -46,7 +45,59 @@ restart_audio() {
 case "$mode" in
   check) check; exit ;;
   restart) restart_audio; check; exit ;;
+  auto-connect)
+    mkdir -p "$state_root"
+    exec 9> "$state_root/auto-connect.lock"
+    flock -n 9 || exit 0
+    # A failed query is not evidence of disconnection.
+    sinks="$(PULSE_SERVER="$local_socket" pactl list short sinks)" || exit 1
+    if awk '{print $2}' <<< "$sinks" | grep -Fxq "$sink"; then
+      if [[ ! -f "$state_root/connected" ]]; then
+        bash "${BASH_SOURCE[0]}" apply
+        PULSE_SERVER="$local_socket" pactl set-default-sink "$sink"
+        touch "$state_root/connected"
+        echo 'Nothing Earの接続を検知し、設定確認と標準出力の切り替えを実行しました。'
+      fi
+    else
+      rm -f "$state_root/connected"
+    fi
+    exit ;;
+  enable-auto)
+    unit_dir="$config_root/systemd/user"
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/nothing-ear-audio-fix.service" <<'UNIT'
+[Unit]
+Description=Check Nothing Ear connection and recover local audio configuration
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nothing-ear-audio-fix auto-connect
+UNIT
+    cat > "$unit_dir/nothing-ear-audio-fix.timer" <<'UNIT'
+[Unit]
+Description=Detect Nothing Ear audio connection every five seconds
+[Timer]
+OnStartupSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+UNIT
+    rm -f "$state_root/connected"
+    systemctl --user daemon-reload
+    systemctl --user enable --now nothing-ear-audio-fix.timer
+    echo 'ログイン中、約5秒間隔で接続を確認します。'
+    exit ;;
+  disable-auto)
+    systemctl --user disable --now nothing-ear-audio-fix.timer
+    systemctl --user stop nothing-ear-audio-fix.service
+    rm -f "$state_root/connected"
+    echo '接続時の自動実行を停止しました。'
+    exit ;;
   undo)
+    if [[ -f "$config_root/systemd/user/nothing-ear-audio-fix.timer" ]]; then
+      systemctl --user disable --now nothing-ear-audio-fix.timer
+      systemctl --user stop nothing-ear-audio-fix.service
+    fi
     [[ -f "$state_root/installed" ]] || { echo '復元用バックアップがありません。'; exit 1; }
     for relative in "${files[@]}"; do
       if [[ -f "$state_root/backup/$relative" ]]; then
@@ -62,7 +113,7 @@ case "$mode" in
     echo '初回適用直前の設定へ復元しました。'
     exit ;;
   apply) ;;
-  *) echo '使い方: nothing-ear-audio-fix [apply|check|restart|undo]'; exit 2 ;;
+  *) echo '使い方: nothing-ear-audio-fix [apply|check|restart|undo|enable-auto|disable-auto|auto-connect]'; exit 2 ;;
 esac
 mkdir -p "$state_root"
 printf '%s\n' "$device_address" > "$state_root/device-address"

@@ -14,10 +14,10 @@ MOCK
 cat > "$fixture/bin/pactl" <<'MOCK'
 #!/usr/bin/env bash
 case "$*" in
- 'list short sinks') printf '1\tbluez_output.AA:BB:CC:DD:EE:FF\tPipeWire\n' ;;
+ 'list short sinks') [[ ! -f "${AUDIO_FIX_TEST_LOG}.disconnected" ]] || exit 0; printf '1\tbluez_output.AA:BB:CC:DD:EE:FF\tPipeWire\n' ;;
  get-default-sink) echo 'bluez_output.AA:BB:CC:DD:EE:FF' ;;
  get-sink-volume*) echo 'Volume: 40%' ;;
- set-default-sink*) ;;
+ set-default-sink*) echo selected >> "${AUDIO_FIX_TEST_LOG}.selected" ;;
  *) echo "Unexpected pactl operation: $*" >&2; exit 1 ;;
 esac
 MOCK
@@ -45,3 +45,20 @@ if grep -q restart "$AUDIO_FIX_TEST_LOG"; then echo 'Idempotency failed'; exit 1
 "$script" undo > /dev/null
 [[ "$(cat "$XDG_CONFIG_HOME/systemd/user/wireplumber.service.d/10-local-audio.conf")" == '# original' ]]
 echo 'PASS: input validation, generated config, restart, idempotency, persisted address, undo, reapply'
+
+"$script" apply > /dev/null
+rm -f "${AUDIO_FIX_TEST_LOG}.selected"
+"$script" auto-connect > /dev/null
+[[ "$(wc -l < "${AUDIO_FIX_TEST_LOG}.selected")" == 1 ]]
+"$script" auto-connect > /dev/null
+[[ "$(wc -l < "${AUDIO_FIX_TEST_LOG}.selected")" == 1 ]]
+touch "${AUDIO_FIX_TEST_LOG}.disconnected"
+"$script" auto-connect > /dev/null
+[[ ! -f "$XDG_STATE_HOME/nothing-ear-audio-fix/connected" ]]
+rm "${AUDIO_FIX_TEST_LOG}.disconnected"
+"$script" auto-connect > /dev/null
+[[ "$(wc -l < "${AUDIO_FIX_TEST_LOG}.selected")" == 2 ]]
+"$script" enable-auto > /dev/null
+grep -Fq 'OnUnitInactiveSec=5s' "$XDG_CONFIG_HOME/systemd/user/nothing-ear-audio-fix.timer"
+"$script" disable-auto > /dev/null
+echo 'PASS: one execution per connection, disconnect/reconnect, timer enable/disable'
