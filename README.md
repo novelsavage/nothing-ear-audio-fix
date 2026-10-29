@@ -112,9 +112,6 @@ bash tests/integration.sh
 - [PipeWire: bluez5.hw-volumeなどのプロパティ](https://pipewire.pages.freedesktop.org/pipewire/devel/page_man_pipewire-props_7.html)
 - [systemd.exec: Environment / UnsetEnvironment](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
 
-## License
-
-MIT
 
 ## Nothing Ear接続時の自動実行
 
