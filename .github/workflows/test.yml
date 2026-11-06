@@ -3,8 +3,15 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  bash:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: bash -n nothing-ear-audio-fix && bash tests/integration.sh
+      - uses: actions/checkout@v7
+      - name: Install Lua parser and interpreter
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+      - name: Check shell scripts
+        run: bash -n nothing-ear-audio-fix && shellcheck nothing-ear-audio-fix tests/integration.sh
+      - name: Test compatibility generation and device scope
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Test application, upgrades, reconnect handling and undo
+        run: bash tests/integration.sh

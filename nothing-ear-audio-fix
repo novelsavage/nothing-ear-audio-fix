@@ -1,70 +1,232 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Keep local desktop audio separate from Chrome Remote Desktop audio.
+# Keep local desktop audio separate from remote-session audio.
 config_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+data_root="${XDG_DATA_HOME:-$HOME/.local/share}"
 state_root="${XDG_STATE_HOME:-$HOME/.local/state}/nothing-ear-audio-fix"
 local_socket="unix:/run/user/$(id -u)/pulse/native"
-device_address="${NOTHING_EAR_ADDRESS:-}"
-if [[ -z "$device_address" && -f "$state_root/device-address" ]]; then
-  device_address="$(cat "$state_root/device-address")"
-fi
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+helper="$script_dir/nothing-ear-loopback-compat.py"
+[[ -f "$helper" ]] || helper="$HOME/.local/libexec/nothing-ear-loopback-compat.py"
 mode="${1:-apply}"
-if [[ "$mode" != check ]]; then
+case "$mode" in
+  apply|check|restart|undo|enable-auto|disable-auto|auto-connect) ;;
+  *) echo '使い方: nothing-ear-audio-fix [apply|check|restart|undo|enable-auto|disable-auto|auto-connect]' >&2; exit 2 ;;
+esac
+device_address="${NOTHING_EAR_ADDRESS:-}"
+stored_address=''
+if [[ -f "$state_root/device-address" ]]; then
+  stored_address="$(cat "$state_root/device-address")"
+fi
+[[ -n "$device_address" ]] || device_address="$stored_address"
+if [[ "$mode" != check && "$mode" != undo && "$mode" != disable-auto ]]; then
   [[ "$device_address" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || {
-    echo 'NOTHING_EAR_ADDRESS に対象機器のBluetoothアドレスを指定してください。' >&2
-    exit 2
+    echo 'NOTHING_EAR_ADDRESS に対象機器のBluetoothアドレスを指定してください。' >&2; exit 2;
   }
 fi
 device_address="${device_address^^}"
-sink="bluez_output.$device_address"
+if [[ "$mode" == apply && -f "$state_root/installed" && -n "$stored_address" && "${stored_address^^}" != "$device_address" ]]; then
+  echo '対象機器を変更する前に、保存済みのアドレスで undo してください。' >&2; exit 2
+fi
 card="bluez_card.${device_address//:/_}"
+compat_target="$data_root/wireplumber/scripts/monitors/bluez.lua"
 files=(
   'systemd/user/wireplumber.service.d/10-local-audio.conf'
   'systemd/user/plasma-plasmashell.service.d/10-local-audio.conf'
   'wireplumber/wireplumber.conf.d/51-nothing-ear-volume.conf'
+  'systemd/user/plasma-kded6.service.d/10-local-audio.conf'
+  'systemd/user/wireplumber.service.d/20-nothing-ear-volume-compat.conf'
 )
+pulse() { PULSE_SERVER="$local_socket" pactl "$@"; }
+find_sink() {
+  local listing name
+  # Query errors must remain distinguishable from a disconnected device.
+  listing="$(pulse list short sinks)" || return 1
+  name="$(awk -F '\t' -v addr="$device_address" '
+    BEGIN { colon="bluez_output." addr; gsub(":", "_", addr); underscored="bluez_output." addr }
+    { name=toupper($2); c=toupper(colon); u=toupper(underscored)
+      if (name==c || index(name,c ".")==1 || name==u || index(name,u ".")==1) { print $2; exit } }
+  ' <<< "$listing")"
+  printf '%s\n' "$name"
+}
 check() {
-  systemctl --user is-active wireplumber.service plasma-plasmashell.service || true
-  systemctl --user show wireplumber.service plasma-plasmashell.service -p Environment
-  printf '現在の標準出力: '
-  PULSE_SERVER="$local_socket" pactl get-default-sink
-  PULSE_SERVER="$local_socket" pactl get-sink-volume @DEFAULT_SINK@
+  systemctl --user is-active wireplumber.service plasma-plasmashell.service plasma-kded6.service || true
+  systemctl --user show wireplumber.service plasma-plasmashell.service plasma-kded6.service -p Environment
+  printf '現在の標準出力: '; pulse get-default-sink
+  pulse get-sink-volume @DEFAULT_SINK@
+  printf '対象機器の出力: '; find_sink
+  if [[ -f "$helper" && -n "$device_address" ]]; then
+    python3 "$helper" --address "$device_address" --output "$compat_target" --check
+  fi
+  if command -v kreadconfig6 >/dev/null; then
+    printf 'KDEの音量変更音: '
+    kreadconfig6 --file plasmaparc --group General --key AudioFeedback --default true
+  fi
 }
 restart_audio() {
+  local sink='' previous_default=''
+  restart_work_dir="$(mktemp -d)"
+  previous_default="$(pulse get-default-sink)" || previous_default=''
+  if ! pulse -f json list sinks > "$restart_work_dir/sinks.json"; then
+    printf '[]\n' > "$restart_work_dir/sinks.json"
+  fi
   systemctl --user daemon-reload
   systemctl --user restart wireplumber.service
   for ((attempt=0; attempt<30; attempt++)); do
-    if PULSE_SERVER="$local_socket" pactl list short sinks | awk '{print $2}' | grep -Fxq "$sink"; then
-      PULSE_SERVER="$local_socket" pactl set-default-sink "$sink"
-      break
-    fi
+    sink="$(find_sink)" || return 1
+    if [[ -n "$previous_default" ]] && pulse list short sinks | awk -F '\t' -v previous="$previous_default" '
+      $2==previous { found=1 } END { exit !found }'; then break; fi
+    [[ -z "$sink" ]] || break
     sleep 0.5
   done
-  systemctl --user restart plasma-plasmashell.service
+  # Preserve the user's selected output even when the target earphones are absent.
+  PULSE_SERVER="$local_socket" python3 - "$restart_work_dir/sinks.json" "$previous_default" "$sink" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+before = json.loads(Path(sys.argv[1]).read_text())
+current = json.loads(subprocess.check_output(['pactl', '-f', 'json', 'list', 'sinks'], text=True))
+previous, fallback = sys.argv[2:4]
+selected = next((s for s in current if s['name'] == previous), None)
+if selected is None:
+    selected = next((s for s in current if s['name'] == fallback), None)
+if selected is not None:
+    name = selected['name']
+    old = next((s for s in before if s['name'] == name), None)
+    if old is not None:
+        values = [str(v['value']) for v in old['volume'].values()]
+        if len(values) != len(selected['volume']):
+            # A2DP/HFP can have different channel counts. Use the quieter value.
+            values = [str(min(v['value'] for v in old['volume'].values()))]
+        subprocess.run(['pactl', 'set-sink-volume', name, *values], check=True)
+        subprocess.run(['pactl', 'set-sink-mute', name, str(int(old['mute']))], check=True)
+    subprocess.run(['pactl', 'set-default-sink', name], check=True)
+PY
+  rm -rf -- "$restart_work_dir"; restart_work_dir=''
+  # Unloading/reloading only audioshortcutsservice can leave dead shortcuts.
+  systemctl --user restart plasma-plasmashell.service plasma-kded6.service
 }
+# Record new managed paths individually, including upgrades from the old version.
+backup_file() {
+  local target="$1" key="$2" legacy="${3:-false}"
+  [[ ! -f "$state_root/recorded/$key" ]] || return 0
+  if [[ "$legacy" != true || ! -f "$state_root/installed" ]]; then
+    if [[ -e "$target" || -L "$target" ]]; then
+      mkdir -p "$(dirname "$state_root/backup/$key")"
+      cp -a -- "$target" "$state_root/backup/$key"
+    fi
+  fi
+  mkdir -p "$(dirname "$state_root/recorded/$key")"
+  touch "$state_root/recorded/$key"
+}
+restore_file() {
+  local target="$1" key="$2"
+  if [[ -e "$state_root/backup/$key" || -L "$state_root/backup/$key" ]]; then
+    mkdir -p "$(dirname "$target")"
+    rm -f -- "$target"
+    cp -a -- "$state_root/backup/$key" "$target"
+  else
+    rm -f -- "$target"
+  fi
+}
+# Escape literal arguments for a systemd ExecStart command (not a shell).
+unit_argument() {
+  local value="$1"
+  value="${value//\\/\\\\}"; value="${value//\"/\\\"}"
+  value="${value//%/%%}"; value="${value//\$/\$\$}"
+  printf '"%s"' "$value"
+}
+apply_config() {
+  [[ -f "$helper" ]] || { echo '互換ヘルパーも README の手順でインストールしてください。' >&2; return 1; }
+  command -v python3 >/dev/null
+  # Refuse unrelated overrides before modifying the configuration.
+  local compat_before compat_after changed=0 work_dir target index legacy
+  compat_before="$(python3 "$helper" --address "$device_address" --output "$compat_target" --check)" || return 1
+  if [[ -e "$compat_target" || -L "$compat_target" ]]; then
+    if [[ -L "$compat_target" ]] || ! head -n 1 "$compat_target" | grep -Fxq -- '-- Generated by nothing-ear-loopback-compat.py; do not edit.'; then
+      echo "既存のWirePlumberスクリプトは上書きしません: $compat_target" >&2; return 1
+    fi
+  fi
+  mkdir -p "$state_root"
+  for index in "${!files[@]}"; do
+    legacy=false; ((index >= 3)) || legacy=true
+    backup_file "$config_root/${files[$index]}" "${files[$index]}" "$legacy"
+  done
+  backup_file "$compat_target" 'data/wireplumber/scripts/monitors/bluez.lua'
+  printf '%s\n' "$device_address" > "$state_root/device-address"
+  touch "$state_root/installed"
+  python3 "$helper" --address "$device_address" --output "$compat_target" || return 1
+  compat_after="$(python3 "$helper" --address "$device_address" --output "$compat_target" --check)" || return 1
+  [[ "$compat_before" == "$compat_after" ]] || changed=1
+  work_dir="$(mktemp -d)"
+  apply_work_dir="$work_dir"
+  cat > "$work_dir/0" <<'CONF'
+[Service]
+Environment=PIPEWIRE_REMOTE=pipewire-0
+UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK PULSE_SERVER
+CONF
+  cat > "$work_dir/1" <<CONF
+[Service]
+Environment=PIPEWIRE_REMOTE=pipewire-0
+Environment=PULSE_SERVER=$local_socket
+UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK
+CONF
+  cat > "$work_dir/2" <<CONF
+# Use software volume for the selected device to avoid Bluetooth volume feedback.
+monitor.bluez.rules = [
+  {
+    matches = [ { device.name = "$card" } ]
+    actions = { update-props = { bluez5.hw-volume = [ ] } }
+  }
+]
+CONF
+  cp "$work_dir/1" "$work_dir/3"
+  {
+    printf '[Service]\n# Retire the scoped override automatically when the vendor script changes.\n'
+    printf 'ExecStartPre=-/usr/bin/python3 "%%h/.local/libexec/nothing-ear-loopback-compat.py" --address %s --output ' "$device_address"
+    unit_argument "$compat_target"; printf '\n'
+  } > "$work_dir/4"
+  for index in "${!files[@]}"; do
+    target="$config_root/${files[$index]}"
+    if ! cmp -s "$work_dir/$index" "$target"; then
+      mkdir -p "$(dirname "$target")"; cp --remove-destination "$work_dir/$index" "$target"; changed=1
+    fi
+  done
+  rm -rf -- "$work_dir"; apply_work_dir=''
+  if ((changed)); then
+    restart_audio
+    echo '設定を適用して音声管理・パネル・音量キー処理を再起動しました。'
+  else
+    echo '設定は適用済みです。再起動は省略しました。'
+  fi
+}
+if [[ "$mode" == check ]]; then check; exit; fi
+trap 'rm -rf -- "${apply_work_dir:-}" "${restart_work_dir:-}"' EXIT
+mkdir -p "$state_root"
+exec 9> "$state_root/operation.lock"
+if [[ "$mode" == auto-connect ]]; then flock -n 9 || exit 0; else flock 9; fi
 case "$mode" in
-  check) check; exit ;;
-  restart) restart_audio; check; exit ;;
+  apply) apply_config; check ;;
+  restart) restart_audio; check ;;
   auto-connect)
-    mkdir -p "$state_root"
-    exec 9> "$state_root/auto-connect.lock"
-    flock -n 9 || exit 0
-    # A failed query is not evidence of disconnection.
-    sinks="$(PULSE_SERVER="$local_socket" pactl list short sinks)" || exit 1
-    if awk '{print $2}' <<< "$sinks" | grep -Fxq "$sink"; then
+    sink="$(find_sink)" || exit 1
+    if [[ -n "$sink" ]]; then
       if [[ ! -f "$state_root/connected" ]]; then
-        bash "${BASH_SOURCE[0]}" apply
-        PULSE_SERVER="$local_socket" pactl set-default-sink "$sink"
+        apply_config
+        # A restart may have changed the output's name or index.
+        sink="$(find_sink)" || exit 1
+        [[ -n "$sink" ]] || exit 1
+        pulse set-default-sink "$sink"
         touch "$state_root/connected"
-        echo 'Nothing Earの接続を検知し、設定確認と標準出力の切り替えを実行しました。'
+        echo '対象機器の接続を検知し、設定確認と標準出力の切り替えを実行しました。'
       fi
     else
       rm -f "$state_root/connected"
-    fi
-    exit ;;
+    fi ;;
   enable-auto)
-    unit_dir="$config_root/systemd/user"
-    mkdir -p "$unit_dir"
+    unit_dir="$config_root/systemd/user"; mkdir -p "$unit_dir"
     cat > "$unit_dir/nothing-ear-audio-fix.service" <<'UNIT'
 [Unit]
 Description=Check Nothing Ear connection and recover local audio configuration
@@ -85,86 +247,28 @@ UNIT
     rm -f "$state_root/connected"
     systemctl --user daemon-reload
     systemctl --user enable --now nothing-ear-audio-fix.timer
-    echo 'ログイン中、約5秒間隔で接続を確認します。'
-    exit ;;
+    echo 'ログイン中、約5秒間隔で接続を確認します。' ;;
   disable-auto)
     systemctl --user disable --now nothing-ear-audio-fix.timer
     systemctl --user stop nothing-ear-audio-fix.service
     rm -f "$state_root/connected"
-    echo '接続時の自動実行を停止しました。'
-    exit ;;
+    echo '接続時の自動実行を停止しました。' ;;
   undo)
+    [[ -f "$state_root/installed" ]] || { echo '復元用バックアップがありません。' >&2; exit 1; }
     if [[ -f "$config_root/systemd/user/nothing-ear-audio-fix.timer" ]]; then
       systemctl --user disable --now nothing-ear-audio-fix.timer
       systemctl --user stop nothing-ear-audio-fix.service
     fi
-    [[ -f "$state_root/installed" ]] || { echo '復元用バックアップがありません。'; exit 1; }
-    for relative in "${files[@]}"; do
-      if [[ -f "$state_root/backup/$relative" ]]; then
-        mkdir -p "$(dirname "$config_root/$relative")"
-        cp -p "$state_root/backup/$relative" "$config_root/$relative"
-      else
-        rm -f "$config_root/$relative"
+    for index in "${!files[@]}"; do
+      if ((index < 3)) || [[ -f "$state_root/recorded/${files[$index]}" ]]; then
+        restore_file "$config_root/${files[$index]}" "${files[$index]}"
       fi
     done
-    restart_audio
-    rm -f "$state_root/installed"
-    rm -rf "$state_root/backup"
-    echo '初回適用直前の設定へ復元しました。'
-    exit ;;
-  apply) ;;
-  *) echo '使い方: nothing-ear-audio-fix [apply|check|restart|undo|enable-auto|disable-auto|auto-connect]'; exit 2 ;;
-esac
-mkdir -p "$state_root"
-printf '%s\n' "$device_address" > "$state_root/device-address"
-if [[ ! -f "$state_root/installed" ]]; then
-  for relative in "${files[@]}"; do
-    if [[ -e "$config_root/$relative" ]]; then
-      mkdir -p "$(dirname "$state_root/backup/$relative")"
-      cp -p "$config_root/$relative" "$state_root/backup/$relative"
+    if [[ -f "$state_root/recorded/data/wireplumber/scripts/monitors/bluez.lua" ]]; then
+      restore_file "$compat_target" 'data/wireplumber/scripts/monitors/bluez.lua'
     fi
-  done
-  touch "$state_root/installed"
-fi
-work_dir="$(mktemp -d)"
-trap 'rm -rf "$work_dir"' EXIT
-cat > "$work_dir/0" <<'CONF'
-[Service]
-Environment=PIPEWIRE_REMOTE=pipewire-0
-UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK PULSE_SERVER
-CONF
-cat > "$work_dir/1" <<CONF
-[Service]
-Environment=PIPEWIRE_REMOTE=pipewire-0
-Environment=PULSE_SERVER=$local_socket
-UnsetEnvironment=PULSE_RUNTIME_PATH PULSE_SINK
-CONF
-cat > "$work_dir/2" <<CONF
-# Use software volume for Nothing Ear to avoid Bluetooth volume feedback.
-monitor.bluez.rules = [
-  {
-    matches = [ { device.name = "$card" } ]
-    actions = {
-      update-props = {
-        bluez5.hw-volume = [ ]
-      }
-    }
-  }
-]
-CONF
-changed=0
-for index in "${!files[@]}"; do
-  target="$config_root/${files[$index]}"
-  if ! cmp -s "$work_dir/$index" "$target"; then
-    mkdir -p "$(dirname "$target")"
-    cp "$work_dir/$index" "$target"
-    changed=1
-  fi
-done
-if ((changed)); then
-  restart_audio
-  echo '設定を適用して音声管理とパネルを再起動しました。'
-else
-  echo '設定は適用済みです。再起動は省略しました。'
-fi
-check
+    restart_audio
+    rm -f "$state_root/installed" "$state_root/connected"
+    rm -rf -- "$state_root/backup" "$state_root/recorded"
+    echo '初回適用直前の設定へ復元しました。' ;;
+esac
